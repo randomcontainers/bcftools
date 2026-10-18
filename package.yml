@@ -1,0 +1,120 @@
+name: bcftools
+title: BCFtools
+summary: Calls, filters, merges and queries genetic variants in VCF and BCF files, with bgzip and tabix from HTSlib.
+homepage: https://samtools.github.io/bcftools/
+# bcftools may be used under MIT or GPL-3.0; it is GPL only when built with
+# GSL or perl filters, and this build has neither. HTSlib is MIT, its cram/
+# directory and htscodecs BSD-3-Clause, utlist.h BSD-1-Clause, and
+# htscodecs' rANS_byte.h and rANS_word.h (from ryg_rans) CC0. md5.c, the date
+# code in hts_time_funcs.h and htscodecs' c_range_coder.h are public domain.
+license: MIT AND BSD-3-Clause AND BSD-1-Clause AND CC0-1.0 AND LicenseRef-Public-Domain
+upstream:
+  source: github-release
+  repository: samtools/bcftools
+  # Release tags look like 1.24 and 1.23.2. Point releases of older series
+  # are sometimes published after a newer release; only versions newer than
+  # the current one are picked up.
+  tag-pattern: '^(1\.\d+(?:\.\d+)?)$'
+  version-template: '{1}'
+  versioning: semver
+  version: "1.24"
+  # The release tarball bundles HTSlib; the "Source code" archives do not.
+  # Upstream publishes no checksums or signatures, so the reconciler pins
+  # the digest GitHub records for the release asset.
+  artifact:
+    url: https://github.com/samtools/bcftools/releases/download/{version}/bcftools-{version}.tar.bz2
+    sha256: 8caddc22610ee2851666047c859bb91da0c1e32d0c2ec553db6f153ad130e46f
+image:
+  entrypoint: [bcftools]
+  cmd: [--help]
+  # The plugins take HTSlib and bcftools symbols from the bcftools
+  # executable that loads them.
+  plugins: [libexec/bcftools]
+test:
+  - |
+    bcftools --version > version.txt
+    if [ "$(head -n 1 version.txt)" != "bcftools $VERSION" ]; then
+      cat version.txt >&2; echo "expected bcftools $VERSION" >&2; exit 1
+    fi
+    # Without GSL and perl filters bcftools is MIT licensed and has no polysomy command.
+    grep -Fxq 'License Expat: The MIT/Expat license' version.txt \
+      || { cat version.txt >&2; echo 'expected the MIT/Expat license line' >&2; exit 1; }
+    if bcftools polysomy > polysomy.txt 2>&1 || ! grep -Fq "unrecognized command 'polysomy'" polysomy.txt; then
+      cat polysomy.txt >&2; echo 'bcftools polysomy should not be built' >&2; exit 1
+    fi
+    hts=$(sed -n 's/^Using htslib //p' version.txt)
+    for tool in bgzip tabix; do
+      "$tool" --version > "$tool.txt"
+      if [ "$(head -n 1 "$tool.txt")" != "$tool (htslib) $hts" ]; then
+        cat "$tool.txt" >&2; echo "expected $tool from htslib $hts" >&2; exit 1
+      fi
+    done
+  - |
+    # bcftools skips a plugin that dlopen cannot load, so the two counts only
+    # match when every plugin resolves its symbols against bcftools.
+    bcftools plugin -l > plugins.txt
+    listed=$(wc -l < plugins.txt)
+    shipped=$(find /usr/local/libexec/bcftools -name '*.so' | wc -l)
+    if [ "$shipped" -eq 0 ] || [ "$listed" -ne "$shipped" ]; then
+      echo "bcftools plugin -l lists $listed plugins, /usr/local/libexec/bcftools has $shipped" >&2
+      bcftools plugin -l -v -v >&2 || true
+      exit 1
+    fi
+    for p in fill-tags setGT split-vep; do
+      grep -Fxq "$p" plugins.txt || { echo "plugin $p is missing" >&2; exit 1; }
+    done
+  - |
+    printf '%s\n' '##fileformat=VCFv4.2' '##contig=<ID=chr1,length=1000>' \
+      '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">' > in.vcf
+    printf '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\n' >> in.vcf
+    printf 'chr1\t%s\t.\t%s\t%s\t50\tPASS\t.\tGT\t%s\t%s\n' \
+      100 A G 0/1 1/1 \
+      200 C T,G 1/2 0/1 \
+      300 G A 0/0 0/1 >> in.vcf
+    bgzip -c in.vcf > in.vcf.gz
+    bgzip -dc in.vcf.gz > back.vcf
+    cmp in.vcf back.vcf
+    tabix -p vcf in.vcf.gz
+    bcftools view -H -r chr1:150-250 in.vcf.gz > region.txt
+    if [ "$(cut -f 2 region.txt)" != 200 ]; then cat region.txt >&2; echo 'expected only the record at 200' >&2; exit 1; fi
+    bcftools norm -m-any -Oz -o split.vcf.gz -W in.vcf.gz
+    bcftools +fill-tags -Ob -o tags.bcf -W split.vcf.gz -- -t AC,AN 2> fill-tags.log \
+      || { cat fill-tags.log >&2; exit 1; }
+    # A plugin built for another bcftools or HTSlib version loads with a warning.
+    if grep -Fq mismatch fill-tags.log; then cat fill-tags.log >&2; exit 1; fi
+    bcftools query -f '%POS %ALT %AC %AN\n' tags.bcf > tags.txt
+    printf '%s\n' '100 G 3 4' '200 T 2 4' '200 G 1 4' '300 A 1 4' > expected.txt
+    cmp expected.txt tags.txt || { echo expected: >&2; cat expected.txt >&2; echo got: >&2; cat tags.txt >&2; exit 1; }
+    bcftools view -H -r chr1:200 tags.bcf > site.txt
+    test "$(wc -l < site.txt)" -eq 2 || { cat site.txt >&2; echo 'expected 2 records at chr1:200' >&2; exit 1; }
+  - |
+    # Ten reads over a 60 bp reference, all with C in place of the A at 30.
+    ref=GATCCTAGGCTTACGATCGGTACCATGCAAGTCTGATCGTAGCTAGGCTTACCGATGCAT
+    alt="$(printf '%s' "$ref" | cut -c 1-29)C$(printf '%s' "$ref" | cut -c 31-60)"
+    printf '>chr1\n%s\n' "$ref" > ref.fa
+    qual=$(printf '%30s' '' | tr ' ' I)
+    {
+      printf '@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:60\n@RG\tID:rg1\tSM:sample1\n'
+      start=6
+      while [ "$start" -le 15 ]; do
+        seq=$(printf '%s' "$alt" | cut -c "$start-$((start + 29))")
+        printf 'read%s\t0\tchr1\t%s\t60\t30M\t*\t0\t0\t%s\t%s\tRG:Z:rg1\n' "$start" "$start" "$seq" "$qual"
+        start=$((start + 1))
+      done
+    } > reads.sam
+    bcftools mpileup -f ref.fa -Ou -o pileup.bcf reads.sam
+    bcftools call -mv -Ov -o calls.vcf pileup.bcf
+    bcftools query -f '%CHROM %POS %REF %ALT [%GT]\n' calls.vcf > calls.txt
+    printf 'chr1 30 A C 1/1\n' > expected.txt
+    cmp expected.txt calls.txt || { echo expected: >&2; cat expected.txt >&2; echo got: >&2; cat calls.txt >&2; exit 1; }
+examples:
+  - title: Print the header of a VCF or BCF file
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/bcftools view -h in.vcf.gz
+  - title: Keep the variants that pass all filters, as compressed VCF with an index
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/bcftools view -f PASS -Oz -o pass.vcf.gz -W in.vcf.gz
+  - title: Split multiallelic sites and left-align indels against the reference
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/bcftools norm -m-any -f ref.fa -Oz -o norm.vcf.gz -W in.vcf.gz
+  - title: Add allele counts and frequencies with the fill-tags plugin
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/bcftools +fill-tags -Oz -o tagged.vcf.gz in.vcf.gz -- -t AC,AN,AF
+  - title: Compress and index a VCF file with bgzip and tabix
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.io/randomcontainers/bcftools -c 'bgzip in.vcf && tabix -p vcf in.vcf.gz'
