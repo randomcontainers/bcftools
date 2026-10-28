@@ -17,13 +17,13 @@ upstream:
   tag-pattern: '^(1\.\d+(?:\.\d+)?)$'
   version-template: '{1}'
   versioning: semver
-  version: "1.24"
+  version: "1.25"
   # The release tarball bundles HTSlib; the "Source code" archives do not.
   # Upstream publishes no checksums or signatures, so the reconciler pins
   # the digest GitHub records for the release asset.
   artifact:
     url: https://github.com/samtools/bcftools/releases/download/{version}/bcftools-{version}.tar.bz2
-    sha256: 8caddc22610ee2851666047c859bb91da0c1e32d0c2ec553db6f153ad130e46f
+    sha256: f96e583d2315998645bb56756f1c8f230c489512db2655b0f623198ebc8a2d99
 image:
   entrypoint: [bcftools]
   cmd: [--help]
